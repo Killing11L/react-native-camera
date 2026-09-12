@@ -1,7 +1,7 @@
 {
   "name": "@react-native-ohos/react-native-camera",
   "description": "A Camera component for React Native. Also reads barcodes.",
-  "version": "3.40.3-beta.1",
+  "version": "3.42.1-rc.1",
   "author": "Lochlan Wansbrough <lochie@live.com> (http://lwansbrough.com)",
   "collective": {
     "type": "opencollective",
@@ -108,12 +108,18 @@
       ]
     ]
   },
-  "harmony": {
-    "alias": "react-native-camera"
-  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
+  },
+  "harmony": {
+    "alias": "react-native-camera",
+    "autolinking": {
+      "ohPackageName": "@react-native-ohos/react-native-camera",
+      "etsPackageClassName": "ReactNativeCameraPackage",
+      "cppPackageClassName": "NativeCameraPackage",
+      "cmakeLibraryTargetName": "rnoh_native_camera"
+    }
   },
   "config": {
     "commitizen": {
@@ -121,3 +127,4 @@
     }
   }
 }
+
