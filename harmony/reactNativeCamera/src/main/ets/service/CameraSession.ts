@@ -1,8 +1,18 @@
 /*
- * Copyright (c) 2024 Huawei Device Co., Ltd. All rights reserved
- * Use of this source code is governed by a MIT license that can be
- * found in the LICENSE file.
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the MIT License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://github.com/react-native-camera/react-native-camera/blob/v4.2.1/LICENSE
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
+
 
 import camera from '@ohos.multimedia.camera';
 import Logger from '../utils/Logger';
@@ -68,6 +78,8 @@ export default class CameraSession {
   private hasAudio: boolean = false
   private ctx!: RNOHContext;
   private cameraDeviceIndex: number = 0;
+  // 4.2.1 cameraId prop：记录上一次生效的 cameraId，用于检测设备精确切换
+  private pendingCameraId: string = '';
   private pictureSize: string;
   public ZoomRange: ZoomRangeType | null = null;
   public photoPreviewScale: number = 1;
@@ -89,6 +101,9 @@ export default class CameraSession {
   private offsetY: number = 0;
   public fps: number = 30;
   private tag: number;
+  // 4.2.1 新增拍照选项：imageType（jpeg/png）与自定义保存 path
+  private pendingImageType: string = 'jpeg';
+  private pendingPhotoPath: string = '';
 
   constructor(_ctx?: RNOHContext) {
     _ctx && (this.ctx = _ctx);
@@ -139,12 +154,22 @@ export default class CameraSession {
     const { surfaceId, props, mediaModel } = config;
     let cameraIndex = 0;
     props.type === "front" ? cameraIndex = 1 : cameraIndex = 0;
-    if (this.cameraDeviceIndex === cameraIndex) {
+    // 4.2.1 cameraId prop：设备精确切换时忽略 type 相同的短路，强制重新 initCamera
+    let forceReinit = false;
+    if (props.cameraId && props.cameraId !== '') {
+      if (this.pendingCameraId !== props.cameraId) {
+        forceReinit = true;
+      }
+      this.pendingCameraId = props.cameraId;
+    } else {
+      this.pendingCameraId = '';
+    }
+    if (this.cameraDeviceIndex === cameraIndex && !forceReinit) {
       return;
     }
     this.cameraDeviceIndex = cameraIndex
     await this.cameraRelease();
-    Logger.info(TAG, `changeCameraPosition: ${props.type}`);
+    Logger.info(TAG, `changeCameraPosition: ${props.type}, cameraId: ${props.cameraId ?? ''}`);
     this.cameraManager = this.getCameraManagerFn();
     this.initCamera(surfaceId, props, mediaModel)
   }
@@ -286,6 +311,17 @@ export default class CameraSession {
       currentDevice = this.camerasArray[0]
     } else {
       currentDevice = this.camerasArray[1]
+    }
+    // cameraId prop 优先：精确匹配 getSupportedCameras 返回的 cameraId
+    if (props.cameraId && props.cameraId !== '') {
+      let matchedDevice = this.camerasArray.find(device => {
+        return device.cameraId === props.cameraId
+      })
+      if (matchedDevice) {
+        currentDevice = matchedDevice
+      } else {
+        Logger.error(TAG, `initCamera cameraId ${props.cameraId} not found, fallback to type selection`);
+      }
     }
     if (this.mediaModel === camera.SceneMode.NORMAL_PHOTO) {
       Logger.debug("initPhotoSession")
@@ -772,8 +808,15 @@ export default class CameraSession {
         await targetSession.stop();
       }
     } catch (error) {
-      Logger.error(TAG, `The activeChange targetSession start call failed. error code: ${error.code}`);
-      this.onError(`The activeChange targetSession start call failed. error code: ${error.code}`)
+      let err = error as BusinessError;
+      // 7400201(SESSION_ERROR_NOT_CONFIG): initCamera 早于 XComponent surface 创建的启动竞态,
+      // surface 就绪后的 changeCameraPosition/initCamera 会重新拉起, 不应向 JS 报错
+      if (err.code === 7400201) {
+        Logger.warn(TAG, "activeChange start skipped: session not config yet (surface not ready)");
+        return;
+      }
+      Logger.error(TAG, `The activeChange targetSession start call failed. error code: ${err.code}`);
+      this.onError(`The activeChange targetSession start call failed. error code: ${err.code}`)
     }
   }
 
@@ -998,8 +1041,11 @@ export default class CameraSession {
 
   // 保存图片
   async savePicture(photoAccess: photoAccessHelper.PhotoAsset): Promise<void> {
-    let photoFile = `${this.basicPath}/${this.outPathArray[0]}/${Date.now().toString()}.jpeg`;
-    // photoFile = await this.getMediaLibraryUri(photoFile, `${Date.now()}`, 'jpeg', photoAccessHelper.PhotoType.IMAGE)
+    // imageType 拍照选项：支持 png（imageType==='png'）与 jpeg 输出；path 拍照选项：自定义保存路径
+    let imageType: string = this.pendingImageType === 'png' ? 'png' : 'jpeg';
+    let photoFile = this.pendingPhotoPath && this.pendingPhotoPath !== '' ?
+      this.pendingPhotoPath :
+      `${this.basicPath}/${this.outPathArray[0]}/${Date.now().toString()}.${imageType}`;
     // 根据相机拍照图片路径，获取文件buffer
     let file = fs.openSync(photoAccess.uri, fs.OpenMode.READ_ONLY);
     let stat = fs.statSync(file.fd);
@@ -1007,6 +1053,26 @@ export default class CameraSession {
     fs.readSync(file.fd, buffer);
     fs.fsyncSync(file.fd);
     fs.closeSync(file);
+    if (imageType === 'png') {
+      // PNG 输出：解码图片后用 ImagePacker 以 image/png 格式编码
+      try {
+        let imageSource = image.createImageSource(photoAccess.uri);
+        let pixelMap = await imageSource.createPixelMap();
+        let imagePacker = image.createImagePacker();
+        let packOpts: image.PackingOption = { format: 'image/png', quality: 100 };
+        let packBuffer = await imagePacker.packToData(pixelMap, packOpts);
+        let _pngFile = fs.openSync(photoFile, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+        await fs.write(_pngFile.fd, packBuffer);
+        fs.closeSync(_pngFile);
+        imagePacker.release();
+        pixelMap.release();
+        imageSource.release();
+        this.photoPath = photoFile;
+        return;
+      } catch (error) {
+        Logger.error(TAG, `savePicture png packing failed,code:${JSON.stringify(error)}. fallback to raw copy`);
+      }
+    }
     let _file;
     try {
       _file = fs.openSync(photoFile, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
@@ -1183,6 +1249,19 @@ export default class CameraSession {
     Logger.debug("takePhoto quality:" + options.quality)
     Logger.debug("takePhoto orientation:" + options.orientation)
     Logger.debug("takePhoto mirrorImage:" + options.mirrorImage)
+
+    // 4.2.1 新增：imageType（jpeg/png）与自定义保存 path
+    if (options) {
+      if (options.imageType === 'png') {
+        this.pendingImageType = 'png';
+      } else {
+        this.pendingImageType = 'jpeg';
+      }
+      this.pendingPhotoPath = options.path ?? '';
+    } else {
+      this.pendingImageType = 'jpeg';
+      this.pendingPhotoPath = '';
+    }
 
     let quality = camera.QualityLevel.QUALITY_LEVEL_MEDIUM;
     if (options) {
@@ -1708,7 +1787,13 @@ export default class CameraSession {
         });
       }
       // 重置
-      await this.avRecorder.reset();
+      try {
+        await this.avRecorder.reset();
+      } catch (resetError) {
+        let resetErr = resetError as BusinessError;
+        // stop 后立即 reset 状态冲突会抛错，不能阻断 onRecordingFinished 回调链
+        Logger.error(TAG, `stopRecording: Failed to reset the avRecorder. error: ${JSON.stringify(resetErr)}`);
+      }
       // 此处不要释放录制实例，否则需要重新创建 videoOutput 加入 session里，会导致画面闪断
 
       if (this.videoSession.hasFlash() &&
